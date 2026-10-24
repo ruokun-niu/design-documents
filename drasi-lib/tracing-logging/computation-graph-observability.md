@@ -119,7 +119,7 @@ Preserve logs, inspection, and business formats. The tracing design covers initi
 
 <!-- This includes the test plan to validate the features such as unit-test and functional tests. -->
 
-Use the [tracing](computation-graph-tracing.md#verification) and [metrics](computation-graph-metrics.md#verification) test plans, including multi-instance isolation, replay, shutdown, and disabled overhead.
+Verify the [tracing](computation-graph-tracing.md) and [metrics](computation-graph-metrics.md) contracts, including multi-instance isolation, replay, shutdown, and disabled overhead.
 
 ## Development Plan (TO BE UPDATED)
 

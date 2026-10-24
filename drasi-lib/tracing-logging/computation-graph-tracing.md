@@ -355,7 +355,7 @@ Source fetch/decode spans can precede publication; they cannot be children of a 
 
 ### Profiles, Sampling, and Logging
 
-Use the [shared profiles](computation-graph-observability.md#2-shared-profiles). Sampling is a trace-only host policy: respect inbound sampling, and choose new-root sampling once. Child spans keep the decision; linked batches may start a separately sampled trace. Enabled metrics are not sampled.
+Use the [shared profiles](computation-graph-observability.md#2-proposed-shared-profiles). Sampling is a trace-only host policy: respect inbound sampling, and choose new-root sampling once. Child spans keep the decision; linked batches may start a separately sampled trace. Enabled metrics are not sampled.
 
 Apply filters per layer so disabling new traces does not suppress log events or the spans needed for component-log routing. Preserve the existing log-to-tracing bridge. A convenience initializer may install defaults only when explicitly called and must report an existing-subscriber conflict.
 
