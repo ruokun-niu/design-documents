@@ -94,6 +94,8 @@ This is illustrative component code, not a new SDK API. The host still chooses t
 
 Static linking removes the FFI boundary, not the need to propagate context. Unlike the old span-handle carrier, the proposed queue carrier holds trace identity without keeping the sending span alive.
 
+The host must keep exporter I/O off graph processing paths and bound its processor/exporter buffers. Static spans do not need the native completed-span handoff below.
+
 ### Tracing a Dynamically Loaded Build
 
 A native plugin cannot use the host's live Rust subscriber or span handles across the ABI. The SDK connects the plugin's local `tracing` infrastructure to a host-owned binding instead. Component authors still add ordinary spans; the SDK handles context and completed-span transport.
@@ -101,14 +103,26 @@ A native plugin cannot use the host's live Rust subscriber or span handles acros
 
 | Direction | Data | Handling |
 |-----------|------|----------|
-| Host -> plugin operation | Trace context, scope, optional opaque timing token | SDK enters context while polling the operation; spawned workers require explicit propagation. |
+| Host -> plugin operation | Trace context, scope, optional opaque timing token | SDK enters context while polling the operation; a batch receives the graph-created batch span's context, not an arbitrary input's context. Spawned workers require explicit propagation. |
 | Plugin -> host output | Event envelope plus separate execution context | Host continues the trace without changing envelope hashes. |
-| Plugin -> host completed span | Name/scope, IDs, parent/links, flags, timestamps, status, bounded safe attributes/events | Host adapter preserves identity/timing and submits to its span-processing/export path. |
+| Plugin -> host completed span | Name/scope, IDs, parent/links, flags, timestamps, status, bounded safe attributes/events | Host adapter preserves identity/timing and uses the bounded, nonblocking handoff below; submission reports acceptance or rejection. |
 | Plugin -> host log event | Level, message, safe fields, component scope, optional trace IDs | Host routes it to the bounded component-log path once; trace sampling does not discard ordinary logs. |
 
 For example, a host operation has span **H** in trace **T**. The SDK gives the plugin that context, and the plugin creates internal span **P** with parent **H**. When **P** finishes, its completed record returns to the host with the original IDs and start/end times. The host submits **P**, not a newly created replacement span. In the opposite direction, a source plugin can create a production span or adopt upstream context and return that context with its output.
 
 Completed plugin spans cannot be recreated with `info_span!()` and keep their original IDs/times. The host therefore provides a completed-span adapter alongside its normal tracing layer. With OpenTelemetry, both feed the configured trace backend and share resource identity, filtering, sampling policy, and shutdown ownership. Callback arrival time is not the span's completion time.
+
+#### Completed-span buffering and loss
+
+The host owns a bounded handoff from native callbacks to a background span-processing worker. Its contract is:
+
+- **Capacity:** configure finite, positive record-count and encoded-byte budgets across all native bindings using that handoff, as well as a maximum record size. Reservations and in-flight records count against these budgets; existing field/count limits also bound decoded allocations. The byte budget must accommodate at least one maximum-size record. Exact default sizes remain a sizing decision, but enabled setup must resolve valid limits or fail explicitly; there is no unbounded mode.
+- **Submission:** check scope and encoded size, then reserve capacity without waiting before copying or decoding. Validate the remaining fields and retain owned data before returning; release the reservation on rejection. Attempt admission once; never wait for queue space, perform exporter I/O, retry, or spawn a task per span. Return an explicit accepted/full/invalid/closed outcome. Acceptance means retained for processing, not successfully exported.
+- **Overflow:** when either budget is exhausted, drop the incoming record (drop newest), preserving already accepted records. Oversized, malformed, or stale-generation records are rejected as invalid; a closed sink rejects new submissions. The SDK does not retry rejected records or accumulate a fallback backlog. Any additional SDK, processor, or exporter buffers must also be bounded.
+- **Loss reporting:** count each discarded record once at the layer that discards it, using unsampled local counters with bounded reason categories such as full, invalid, closed, and shutdown timeout. SDK-side failures are counted locally; a host-reported rejection is not counted again by the SDK. Counters remain readable through local diagnostics independently of this queue or metric export. Emit rate-limited summaries through the existing log path, without creating spans or recursively reporting failures of that diagnostic path. Intentional filtering, sampling, or disablement is not loss; downstream exporter loss is reported separately by the host.
+- **Processing and shutdown:** losing a completed span must not fail the component operation, alter its result, or remove propagated trace context. Stop producers before closing admission, keep callback owners alive until producers and in-flight callbacks finish, then drain accepted records within the host's shutdown deadline. Count any records discarded at that deadline before shutting down export.
+
+Implementation verification must stall the consumer and exceed each budget independently: callbacks must return without waiting for capacity, retained records must remain within the limits, and loss counts must match rejected submissions. Also cover concurrent producers, invalid/stale records, closed admission, and shutdown timeout without recursive diagnostics or component failures.
 
 The [span catalogue](#span-names-and-instrumentation) defines emission ownership and attributes; the [API design](#api-design) shows the proposed trace records.
 
@@ -147,6 +161,8 @@ Each transfer uses the configured pipe. Debug `pipe.send` spans measure forwardi
 Where invoked, the proposed debug spans `component.confirm_outputs` and `pipe.acknowledge` show the separate output-confirmation and acknowledgement calls. Neither means that an external effect completed.
 
 A successful sink call means only its declared **Accepted** or **Handled** boundary. An acceptance-only sink's internal queue needs its own context propagation and processing spans before a trace can show later delivery. A failed or cancelled batch does not imply that all external effects were rolled back.
+
+When a sink combines inputs, apply the [batch parent and link policy](#batch-parent-and-link-policy) rather than inheriting an arbitrary input's trace.
 
 #### Bootstrap flow
 
@@ -305,7 +321,7 @@ Only record an evaluator or commit span when that operation actually runs. Outpu
 |------|------------------------|----------------|-------------------|---------|
 | `pipe.send` | Actual pipe acceptance boundary; once per send, not once per logical edge sharing that send | Begin acceptance, including capacity wait -> receipt, failure, or cancellation | `queue_id`, `output_port` when known, `acceptance=accepted/not_accepted/unknown` | debug |
 | `sink.handle` | Graph sink execution; once per single-input handler call | Invoke `handle` -> its declared completion boundary or an error/cancellation | `input_port`, `input_count=1`, `change_count`, `completion=accepted/handled` | basic |
-| `sink.handle_batch` | Graph sink execution; once per actual batch-handler call | Invoke `handle_batch` after batch collection -> the batch call returns or is interrupted | `input_port`, `input_count`, `change_count`, `completion=accepted/handled` | basic |
+| `sink.handle_batch` | Graph sink execution; once per actual batch-handler call | Invoke `handle_batch` after batch collection -> the batch call returns or is interrupted | `input_port`, `input_count`, `change_count`, `completion=accepted/handled`, `links_truncated` | basic |
 | `pipe.acknowledge` | Graph/provider acknowledgement boundary; only when a supported acknowledgement handle is actually completed | Invoke `Acknowledgement::complete` -> the provider accepts the reported outcome or returns an error/cancellation | `queue_id`, `input_port` when known, `handling_outcome=handled/failed` | debug; proposed addition |
 
 `pipe.send` ends at the provider's acceptance boundary, not at dequeue or handling. A declared lossy pipe can accept and discard an event. Durable acceptance ambiguity and cancellation must not be reported as definite nonacceptance. Shared queues and multicast record the actual send once.
@@ -313,6 +329,28 @@ Only record an evaluator or commit span when that operation actually runs. Outpu
 Batch collection time is outside `sink.handle_batch`. Its `completion` field describes the sink's contract; only a successful call reaches that boundary. Failure or cancellation does not prove that partial external effects were rolled back.
 
 Successful acknowledgement means the provider accepted the reported handling outcome, not an end-to-end commit. Dropping a delivery is not acknowledgement, and an acceptance-only sink cannot be upgraded to handled completion. Retrospective queue-residence spans remain separate follow-up work.
+
+##### Batch parent and link policy
+
+The graph chooses the parent and links before creating `sink.handle_batch`, using the inputs in the order passed to the handler. The same rule applies to static and native sinks:
+
+| Input contexts | Batch span |
+|----------------|------------|
+| A nonempty batch whose inputs all carry the same valid `TraceContextV1` | Create a child of that context in the same trace; no redundant links. This includes a single-input batch. |
+| No input carries valid context | Create a new root with no links. |
+| Otherwise: different contexts, or a mixture of contextual and context-free inputs | Create a new root with links to the valid input contexts, subject to the limits below. Different parent spans in the same trace also use this rule. |
+
+A new root has no implicit parent from the batch collector's current span. Invalid contexts are diagnosed through the existing validation path and treated as absent for this decision, without rejecting otherwise valid input data.
+
+**Link selection and limits.** Use a finite, positive host-configured link-count limit compatible with the host adapter, processor/exporter, and native record limits. Numeric defaults remain a sizing decision. Retain the first distinct contexts in batch order, deduplicating by `(trace_id, span_id)`; the first occurrence supplies the link's flags and trace state. Stop retaining new contexts when the count or span-record byte budget is reached. Keep only the bounded retained set, not an unbounded intermediate link list. Set `links_truncated=true` if any valid input context is left unrepresented because of these limits; otherwise set it to false. Link omission does not drop inputs or change the handler's batch.
+
+**Sampling.** A child batch inherits its parent's sampling decision. For a new root, supply the retained links and truncation flag before the host's root sampler runs, and make one decision for the batch. Linked inputs keep their original sampling flags; there is no automatic OR of those flags or implicit choice of one input as the sampling parent. A host sampler may use the bounded links. Propagate the batch context even when its span is unsampled; plugin children inherit that decision, while enabled metrics remain independent.
+
+**Callback context.** The operation-level `ExecutionContext.trace` passed to a native batch callback identifies the graph-created `sink.handle_batch` span, with its trace ID, new span ID, and sampling flags. The SDK enters that context while polling the callback, so component-authored spans become children of the batch span; it neither chooses another input parent nor creates a duplicate batch wrapper. Static callbacks run under the same batch span. Individual input execution contexts remain attached to their inputs, separate from the operation context; none of this metadata is written into durable event data.
+
+For example, inputs `(trace A, span a)` and `(trace B, span b)` produce batch root `(trace C, span c)` linked to both when they fit the budget. The native callback receives `(C, c)`, and an internal `http.post` span has parent `c`, not `a` or `b`.
+
+Verify identical, absent, mixed, and same-trace/different-parent contexts; duplicate links; count/byte truncation; conflicting input sampling decisions; and native child parentage under both sampled and unsampled batch roots.
 
 #### Bootstrap and scheduled processing
 
@@ -355,7 +393,7 @@ Source fetch/decode spans can precede publication; they cannot be children of a 
 
 ### Profiles, Sampling, and Logging
 
-Use the [shared profiles](computation-graph-observability.md#2-proposed-shared-profiles). Sampling is a trace-only host policy: respect inbound sampling, and choose new-root sampling once. Child spans keep the decision; linked batches may start a separately sampled trace. Enabled metrics are not sampled.
+Use the [shared profiles](computation-graph-observability.md#2-proposed-shared-profiles). Sampling is a trace-only host policy: respect the selected parent's sampling decision, and choose new-root sampling once. Child spans keep the decision; batches use the explicit [parent, link, and sampling policy](#batch-parent-and-link-policy) above. Enabled metrics are not sampled.
 
 Apply filters per layer so disabling new traces does not suppress log events or the spans needed for component-log routing. Preserve the existing log-to-tracing bridge. A convenience initializer may install defaults only when explicitly called and must report an existing-subscriber conflict.
 
@@ -371,7 +409,9 @@ These are proposed API responsibilities, not claims that the functions already e
 | `init_component_logging()` | Returns a `ComponentLogRuntime`: registry, layer, bounded worker ownership, and awaited drain/shutdown. Installs no globals. |
 | `init_default_subscriber()` | Explicit convenience setup; returns ownership or an error, never silently ignores a subscriber conflict. |
 | `DrasiLibBuilder::with_telemetry(...)` | Receives collection settings and optional context-adapter capability; no implicit global installation. Direct graph builders need equivalent settings. |
+| Host trace-context adapter | Supports an explicit parent or root, bounded links and attributes supplied before sampling, and extraction of the resulting operation context even when unsampled. |
 | Host SDK telemetry binding | Attaches the host context adapter, completed-span sink, and log routing before plugin construction, alongside the metric callbacks. |
+| Completed-span sink | Resolves host-owned count/byte limits and provides nonblocking submission with explicit accepted/full/invalid/closed outcomes, local loss diagnostics, and deadline-bounded draining. See the [handoff contract](#completed-span-buffering-and-loss). |
 | Execution-context carrier | Adds transient metadata to runtime deliveries and versioned plugin frames. Its Rust placement must be reviewed with public input/output types; it is not a silent wire-field addition. |
 
 Default construction preserves logs/inspection and leaves new collection off. Install the subscriber and native telemetry bindings before component construction. Explicitly enabled distributed tracing requires a context adapter; missing capability is reported, not silently presented as connected tracing.
@@ -447,7 +487,7 @@ pub struct CompletedSpanV1 {
 }
 ```
 
-- **Context propagation:** `TraceContextV1.span_id` identifies the sending span when passed to another operation. The receiving span uses it as its parent and gets its own span ID. `None` in `ExecutionContext.trace` means no supplied context, not an all-zero trace ID.
+- **Context propagation:** `TraceContextV1.span_id` identifies the sending span when passed to another operation. A single-input receiving operation uses it as its parent and gets its own span ID; a batch uses the [parent/link policy](#batch-parent-and-link-policy). Native callbacks receive the resulting operation span's context, separately from any per-input contexts. `None` in `ExecutionContext.trace` means no supplied context, not an all-zero trace ID.
 - **Completed records:** `CompletedSpanV1.context` identifies the completed span itself; `parent_span_id` is separate and is `None` for a root. Links can refer to other traces. The host preserves these identities and original timestamps instead of creating a replacement span. Unix timestamps describe the trace timeline; internal duration measurements still use local monotonic timers.
 - **Runtime placement:** execution context accompanies input/output deliveries separately from the serialized event envelope and its receipt digest. This sketch shows only its trace portion; optional timing-token metadata is covered by the metrics design. It is not added to indexed rows, journals, outboxes, or hashed annotations.
 - **Native transport:** encode the V1 records as bounded MessagePack in the negotiated computation-ABI extension's operation frames/callbacks. These Rust structs, including their `String` and `Vec` fields, do not cross FFI by memory layout. No live Rust spans, trait objects, or `Instant` values cross the boundary.

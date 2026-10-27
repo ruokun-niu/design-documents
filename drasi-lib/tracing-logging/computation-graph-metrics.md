@@ -187,6 +187,33 @@ Do not turn generation, trace IDs, sequences, or error messages into metric labe
 
 Exporter retention governs old series; capacity limits for continually changing configured IDs remain necessary. Do not add generation labels to evade retirement.
 
+#### Counter accumulation across generations
+
+Absolute counter updates report a total for the current binding/generation, not a process-wide or restored total that includes earlier generations. The scoped emitter converts these totals into increments of the stable host counter. Forwarding them directly to [`Counter::absolute`](https://docs.rs/metrics/0.24.2/metrics/trait.CounterFn.html#tymethod.absolute) would only raise the host counter to the reported value, losing contributions after replacement.
+
+Each scoped counter tracks a local total `L`, initially zero, keyed by binding, generation, and instrument identity (name and labels). Re-registering the same instrument or cloning its handle shares this state:
+
+| Scoped update | Local accounting | Host recorder update |
+|---------------|------------------|----------------------|
+| `increment(d)` | Set `L = L + d` | `Counter::increment(d)` |
+| `absolute(v)` | Compute `delta = max(v - L, 0)`, then set `L = max(L, v)` | `Counter::increment(delta)` when positive |
+
+Repeated or older absolute reports add nothing; a smaller value is not interpreted as a reset. Mixed calls refer to the same local count: an absolute report must include increments already reported for that count. Independent producers must not submit unrelated absolute totals under the same scoped instrument.
+
+Apply this rule in static scoped handles and native Host SDK callbacks, exactly once per update. Serialize scope validation, local accounting, and forwarding per scoped counter so concurrent calls or revocation cannot double-count or admit stale writers. Replacement starts a new local total at zero without resetting the host series; revoked-generation updates are rejected through the existing loss diagnostics.
+
+Required behavior in both build modes, starting with an empty host counter:
+
+| Generation | Update | Forwarded increment | Host total |
+|------------|--------|---------------------|------------|
+| A | `absolute(100)` | 100 | 100 |
+| B, replacing A | `absolute(10)` | 10 | 110 |
+| B | `absolute(10)` again, then older `absolute(8)` | 0 | 110 |
+| B | `increment(5)` | 5 | 115 |
+| B | `absolute(15)` | 0 | 115 |
+| B | `absolute(20)` | 5 | 120 |
+| A, revoked | `absolute(120)` | Rejected | 120 |
+
 #### Catalogue and count semantics
 
 The proposed initial catalogue preserves the original operational metrics, adds four generic component instruments, and delays end-to-end timing until its completion contract is implemented:
@@ -224,10 +251,10 @@ The advantage is common instrumentation for new component implementations. The c
 Graph instrumentation, built-in components, and statically linked plugins use the host's normal `metrics` infrastructure:
 
 ```text
-Graph / component -> metrics facade handles -> host recorder -> host exporter
+Graph / component -> scoped metrics facade handles -> host recorder -> host exporter
 ```
 
-No FFI telemetry transport is needed. Register/cache handles after recorder installation and outside hot loops. The scoped SDK emitter attaches component identity at registration; an unscoped macro does not infer which Drasi instance owns a measurement.
+No FFI telemetry transport is needed. Register/cache handles after recorder installation and outside hot loops. The scoped SDK emitter attaches component identity at registration and applies the [counter accumulation rule](#counter-accumulation-across-generations) before updating the host recorder. Scoped counters wrap the host handle rather than expose it directly; an unscoped macro does not infer component identity or replacement semantics.
 
 #### 5.2 Dynamically Loaded Build
 
@@ -242,13 +269,13 @@ This is not the legacy Source/Reaction ABI or a second per-signal bridge. Regist
 | Direction | Data | Handling |
 |-----------|------|----------|
 | Plugin -> host metric registration | Name, instrument type, labels, description, unit | Register/cache a scoped opaque handle outside hot loops; not a live Rust recorder handle. |
-| Plugin -> host metric update | Registered handle, operation and value | Apply to the host recorder: counter increment/absolute, gauge set/increment/decrement, or histogram observation. |
+| Plugin -> host metric update | Registered handle, operation and value | Convert scoped counter increments/absolute totals to host increments using the shared accumulation rule; apply gauge set/increment/decrement or histogram observations directly. |
 
 The SDK installs its library-local recorder once, but binds separate host-owned scopes for component instances. Host-assigned scope identity cannot be overridden by plugin labels; out-of-scope emissions are explicitly unattributed, not assigned to a random instance.
 
 Records use bounded MessagePack and existing ABI buffer ownership rules. The host copies borrowed data before returning; callbacks cannot retain borrowed pointers. Handles are revocable and generation-fenced. Missing extensions retain host-side instrumentation and explicitly lack plugin internals; they do not fall back to the legacy ABI.
 
-Metric updates are unsampled and applied locally before any lossy exporter queue. Do not route them through the droppable span queue. The embedder must use recorder implementations suitable for the hot path, with no network I/O in update callbacks.
+Metric updates are unsampled and applied locally before any lossy exporter queue. Do not route them through the [bounded, droppable completed-span queue](computation-graph-tracing.md#completed-span-buffering-and-loss). The embedder must use recorder implementations suitable for the hot path, with no network I/O in update callbacks.
 
 Plugin authors optionally add internal metrics. The SDK provides scoped metric handles under `drasi.plugin.<kind>.*`; raw unscoped macros do not magically acquire component identity. Framework measurements remain host-owned so plugin telemetry does not duplicate them.
 
@@ -275,7 +302,7 @@ These are proposed responsibilities, not claims that the APIs already exist:
 | `TelemetryProfile::resolve()` | Produces filters and collection flags; no exporter construction. |
 | `DrasiLibBuilder::with_telemetry(...)` | Receives collection settings without installing a recorder; direct graph builders need equivalent settings. |
 | Host SDK telemetry binding | Installs scoped metric registration/update callbacks before plugin construction, alongside the trace/log callbacks. |
-| Scoped metric emitter | Registers custom instruments under the plugin's namespace and captures host-assigned identity in their handles. |
+| Scoped metric emitter | Registers custom instruments under the plugin's namespace, captures host-assigned identity, and applies the same counter accumulation semantics in static and native builds. |
 | Host recorder setup | Install before components cache handles; retain exporter ownership through shutdown. |
 
 Default construction leaves new collection off and preserves logs/inspection. No library REST, CLI, or Go API is added; scrape routes and server configuration belong to the companion server design.
@@ -284,8 +311,8 @@ Default construction leaves new collection off and preserves logs/inspection. No
 
 Register an instrument once, then update its cached handle. The SDK hides the difference between static and dynamic builds:
 
-- **Static:** register against the host's normal `metrics` recorder with the component's identity labels; updates use its counter, gauge, or histogram handles directly.
-- **Native plugin:** register through the scope-bound Host SDK callback and receive an opaque handle. SDK-backed `metrics` handles turn later calls into typed updates for that handle.
+- **Static:** register against the host's normal `metrics` recorder with the component's identity labels. Scoped counter handles apply local accounting before incrementing the host counter; gauge and histogram updates use the host handles directly.
+- **Native plugin:** register through the scope-bound Host SDK callback and receive an opaque handle. SDK-backed `metrics` handles turn later calls into typed updates for that handle; the Host SDK applies counter accounting, so the plugin does not also convert absolute totals.
 
 The following Rust data shapes illustrate the proposed native registration/update contract. Names and wire details are not finalized:
 
@@ -344,7 +371,7 @@ if let Err(error) = binding.update_metric(update) {
 
 The native binding encodes bounded MessagePack records through the shared, versioned computation-ABI extension. The Rust structs and their `String`/`Vec` storage do not cross FFI by memory layout. This does not append fields to the legacy Source/Reaction registration table.
 
-The host validates the scope, generation, instrument type, and value, then applies the update to its cached handle: for example, `Counter::increment`, `Counter::absolute`, `Gauge::set`, or `Histogram::record`. This happens locally, before exporter buffering. It is neither sampled nor sent through the span queue, and it performs no exporter network I/O.
+The host validates the scope, generation, instrument type, and value, then applies the [counter accumulation rule](#counter-accumulation-across-generations) before updating its cached handle. Both `CounterIncrement` and `CounterAbsolute` contribute through `Counter::increment`; generation-local totals never go directly to the host's `Counter::absolute`. Gauge and histogram updates use the corresponding operations, such as `Gauge::set` or `Histogram::record`. This happens locally, before exporter buffering. It is neither sampled nor sent through the span queue, and it performs no exporter network I/O.
 
 `report_metric_loss` uses local, non-recursive loss diagnostics and rate-limited warnings, not the failing metric bridge. Update failure must not become a component-processing failure. Invalid registrations are reported during initialization; intentional collection disablement returns no-op facade handles before this enabled path. Missing bridge capabilities remain explicit diagnostics, not a claim that plugin metrics are working.
 
