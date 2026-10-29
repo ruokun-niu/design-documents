@@ -443,6 +443,17 @@ Framework labels are bounded identifiers and closed categories, not payloads, qu
 
 Reject reserved metric-namespace spoofing and identity-label overrides. Export transport authentication and access control belong to the host.
 
+## Development Plan
+
+<!-- This section is for planning how you will deliver your features. This includes aligning work items to features, scenarios or requirements, defining what deliverable will be checked in at each point in the product and estimating the cost of each work item. Don't forget to include the Unit Test and functional test in your estimates. -->
+
+1. **Establish metrics foundations:** Define metric contracts, collection profiles, filters, stable labels, and host-owned recording.
+2. **Instrument graph operations and queues:** Measure counts, durations, readiness, admission, and queue pressure without double-counting shared queues or multicast.
+3. **Add query, reaction, and persistence metrics:** Measure evaluation, results, bootstrap, scheduled work, and actual reaction handling; expose supported recovery and persistence measurements.
+4. **Implement scoped plugin metrics:** Provide consistent static/native APIs over the shared telemetry bridge, with automatic identity labels and correct component-replacement accounting.
+5. **Validate and document metrics:** Verify exact counts, trace-independent collection, replacement behavior, bounded resource use, and performance; demonstrate host export and document usage.
+6. **Add handled-branch latency metrics (deferred):** Define completion semantics and measure source-to-handled-sink latency without treating queue acceptance as completed processing.
+
 
 ## Appendices
 

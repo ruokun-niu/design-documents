@@ -561,6 +561,17 @@ The initialization split deliberately changes the old implicit-global API and re
 
 Use the native ABI's separately versioned extension pattern; do not append fields to frozen base vtables or assume the legacy registration table is sufficient. Legacy plugin loading/logging remains supported, but full internal trace propagation there needs its own negotiated bridge. Rebuild actual cdylibs for compatibility tests.
 
+## Development Plan
+
+<!-- This section is for planning how you will deliver your features. This includes aligning work items to features, scenarios or requirements, defining what deliverable will be checked in at each point in the product and estimating the cost of each work item. Don't forget to include the Unit Test and functional test in your estimates. -->
+
+1. **Establish tracing foundations:** Define tracing contracts, host-owned logging, collection profiles, filtering, sampling, and component identities.
+2. **Add portable execution context:** Carry trace context through inputs, outputs, and async tasks without changing persisted event data.
+3. **Instrument graph and query operations:** Add spans for processing, query evaluation/commits, sink batches, lifecycle/control, forwarding, confirmation, and acknowledgement.
+4. **Cover asynchronous and recovery paths:** Preserve context through pipes, admission, bootstrap, scheduled work, replay, and existing source/reaction/service workers.
+5. **Bridge native-plugin tracing and logs:** Introduce shared ABI context transport and bounded plugin span/log collection, preserving identity, timing, and loss diagnostics.
+6. **Demonstrate and validate tracing:** Demonstrate HTTP context propagation and host-owned export; verify static/native correctness, compatibility, shutdown, and overhead, and document integration.
+
 ## Appendices
 
 <!-- Optional. Describe additional information supporting this design. For instance, describe the details of alternative design if you have one. -->
