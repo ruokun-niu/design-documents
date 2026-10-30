@@ -565,12 +565,47 @@ Use the native ABI's separately versioned extension pattern; do not append field
 
 <!-- This section is for planning how you will deliver your features. This includes aligning work items to features, scenarios or requirements, defining what deliverable will be checked in at each point in the product and estimating the cost of each work item. Don't forget to include the Unit Test and functional test in your estimates. -->
 
-1. **Establish tracing foundations:** Define tracing contracts, host-owned logging, collection profiles, filtering, sampling, and component identities.
-2. **Add portable execution context:** Carry trace context through inputs, outputs, and async tasks without changing persisted event data.
-3. **Instrument graph and query operations:** Add spans for processing, query evaluation/commits, sink batches, lifecycle/control, forwarding, confirmation, and acknowledgement.
-4. **Cover asynchronous and recovery paths:** Preserve context through pipes, admission, bootstrap, scheduled work, replay, and existing source/reaction/service workers.
-5. **Bridge native-plugin tracing and logs:** Introduce shared ABI context transport and bounded plugin span/log collection, preserving identity, timing, and loss diagnostics.
-6. **Demonstrate and validate tracing:** Demonstrate HTTP context propagation and host-owned export; verify static/native correctness, compatibility, shutdown, and overhead, and document integration.
+### 1. Establish tracing foundations
+
+- Define span names, safe fields, component identities, collection profiles, filtering, and parent-based sampling.
+- Separate component logging from explicit host subscriber setup; keep export and shutdown host-owned.
+- Wire settings into library and direct graph builders without installing process-global subscribers.
+- Test defaults, subscriber conflicts, profile filtering, and continued logs/inspection when tracing is disabled.
+
+### 2. Add portable execution context
+
+- Finalize the transient execution-context carrier and document compatibility or migration requirements for public input/output APIs.
+- Carry context with runtime inputs, outputs, and pipe deliveries, never in persisted event data or receipt digests.
+- Add runtime/SDK helpers to restore trace context and component scope across awaits, spawned tasks, and worker queues.
+- Test parentage, component isolation, cancellation, and unchanged serialization/digests in static and native builds.
+
+### 3. Instrument graph and query operations
+
+- Instrument source publication, component processing, query evaluation, and commits at their owning boundaries without duplicate wrappers.
+- Add distinct spans for pipe acceptance, sink handling/batches, output confirmation, and supported acknowledgements.
+- Instrument lifecycle/control calls and apply the batch parent/link policy before sampling.
+- Verify span counts, timing, parentage, and outcomes for zero/one/many outputs, fan-out, failures, and cancellation.
+
+### 4. Cover asynchronous and recovery paths
+
+- Propagate context through polled/admission sources, buffered/shared pipes, fan-out, and continuations.
+- Add bootstrap and scheduled/replay traces using existing runtime paths, without per-row spans or persisted trace history.
+- Update Source, Reaction, and service workers where actual processing occurs outside graph callbacks.
+- Test no-work wakeups, replay/restart, queued reactions, and backpressure while preserving processing behavior and log routing.
+
+### 5. Bridge native-plugin tracing and logs
+
+- Define one versioned telemetry ABI for trace context, spans/logs, and metrics, with capability negotiation and no changes to frozen vtables.
+- Implement SDK capture and bounded, nonblocking host collection that preserves identity/timing and reports losses explicitly.
+- Adopt the updated SDK and rebuild native plugins; preserve supported loading/logging and report missing telemetry capabilities.
+- Use an isolated POC before production bridge work; test real native libraries, saturation, replacement, and shutdown draining.
+
+### 6. Demonstrate and validate tracing
+
+- Demonstrate HTTP context extraction/injection through static/native components with host-owned export.
+- Run correctness and compatibility tests across both Tokio runtime flavors, multiple instances, and sampled/unsampled/off configurations.
+- Measure disabled/enabled overhead, allocations, and retained telemetry against agreed budgets, including stalled or unavailable exporters.
+- Document integration, API migration, plugin SDK/rebuild requirements, collection limits, loss diagnostics, and shutdown.
 
 ## Appendices
 
